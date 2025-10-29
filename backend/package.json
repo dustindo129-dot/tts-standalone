@@ -1,0 +1,22 @@
+{
+  "name": "tts-standalone-backend",
+  "version": "1.0.0",
+  "description": "Standalone TTS Backend Service",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "@google-cloud/text-to-speech": "^5.1.0",
+    "uuid": "^9.0.0",
+    "express-validator": "^7.0.1"
+  },
+  "keywords": ["tts", "text-to-speech", "google-cloud", "express"],
+  "author": "Dustin Do",
+  "license": "MIT"
+}
