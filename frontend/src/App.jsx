@@ -250,7 +250,7 @@ function App() {
       <header className="header">
         <div className="container">
           <h1>🎤 Cloud Text-to-Speech Service</h1>
-          <p>Convert English text to natural-sounding audio powered by Google Cloud TTS</p>
+          <p>Convert English text to natural-sounding audio powered by Google Cloud TTS (Project by Dustin Do)</p>
         </div>
       </header>
 
