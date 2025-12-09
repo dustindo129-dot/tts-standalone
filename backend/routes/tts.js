@@ -1,6 +1,8 @@
 import express from 'express';
-import { generateTTS, getTTSUsage, getTTSPricing } from '../services/ttsService.js';
+import { generateTTS, generateConversationTTS, getTTSUsage, getTTSPricing } from '../services/ttsService.js';
 import { body, validationResult } from 'express-validator';
+import { optionalAuth } from '../middleware/auth.js';
+import { audioHistoryModel, conversationHistoryModel } from '../db/database.js';
 
 const router = express.Router();
 
@@ -42,12 +44,39 @@ const validateTTSRequest = [
         .withMessage('Volume gain must be between -96.0 and 16.0 dB')
 ];
 
+// Validation middleware for conversation TTS generation
+const validateConversationRequest = [
+    body('conversationSegments')
+        .isArray({ min: 1, max: 50 })
+        .withMessage('Conversation must have between 1 and 50 segments'),
+    body('conversationSegments.*.text')
+        .trim()
+        .isLength({ min: 1, max: 1000 })
+        .withMessage('Each segment text must be between 1 and 1,000 characters'),
+    body('conversationSegments.*.voiceName')
+        .custom((value) => {
+            const validVoices = ['female', 'male', 'neural-female', 'neural-male'];
+            const legacyPattern = /^en-US-(Standard|Wavenet|Neural2)-(A|B|C|D|F)$/;
+            return validVoices.includes(value) || legacyPattern.test(value);
+        })
+        .withMessage('Invalid voice name for segment'),
+    body('title')
+        .optional()
+        .trim()
+        .isLength({ max: 100 })
+        .withMessage('Title must be less than 100 characters'),
+    body('speakerPauseDuration')
+        .optional()
+        .isFloat({ min: 0.1, max: 3.0 })
+        .withMessage('Speaker pause duration must be between 0.1 and 3.0 seconds')
+];
+
 /**
  * @route POST /api/tts/generate
  * @desc Generate TTS audio from text using Google Cloud TTS
- * @access Public (no authentication required for standalone version)
+ * @access Public (supports both authenticated and anonymous users)
  */
-router.post('/generate', validateTTSRequest, async (req, res) => {
+router.post('/generate', optionalAuth, validateTTSRequest, async (req, res) => {
     try {
         // Check for validation errors
         const errors = validationResult(req);
@@ -77,15 +106,41 @@ router.post('/generate', validateTTSRequest, async (req, res) => {
             ...audioConfig
         };
 
-        // Generate TTS audio (no userId needed for standalone)
+        // Get userId from authenticated user or use 'anonymous'
+        const userId = req.user ? req.user.id : 'anonymous';
+
+        // Generate TTS audio
         const result = await generateTTS({
             text,
             languageCode,
             voiceName,
             audioConfig: defaultAudioConfig,
-            userId: 'anonymous',
+            userId: userId,
             characterCount
         });
+
+        // Save to history if user is authenticated (save even for cache hits)
+        if (req.user) {
+            try {
+                // Extract filename from audioUrl
+                const audioFilename = result.audioUrl.split('/').pop();
+                
+                await audioHistoryModel.create({
+                    userId: req.user.id,
+                    text: text.substring(0, 500), // Store first 500 chars to save space
+                    voiceName: result.voiceUsed,
+                    speakingRate: defaultAudioConfig.speakingRate,
+                    audioUrl: result.audioUrl,
+                    audioFilename: audioFilename,
+                    characterCount: result.characterCount,
+                    estimatedCostUSD: result.cacheHit ? 0 : result.estimatedCostUSD, // No cost for cached content
+                    duration: result.duration
+                });
+            } catch (historyError) {
+                console.error('Failed to save audio history:', historyError);
+                // Don't fail the request if history save fails
+            }
+        }
 
         // TTS generation completed successfully
         res.json({
@@ -135,15 +190,196 @@ router.post('/generate', validateTTSRequest, async (req, res) => {
 });
 
 /**
+ * @route POST /api/tts/generate-conversation
+ * @desc Generate TTS audio from conversation segments using Google Cloud TTS
+ * @access Public (supports both authenticated and anonymous users)
+ */
+router.post('/generate-conversation', optionalAuth, validateConversationRequest, async (req, res) => {
+    try {
+        // Check for validation errors
+        const errors = validationResult(req);
+        if (!errors.isEmpty()) {
+            return res.status(400).json({
+                success: false,
+                message: 'Validation failed',
+                errors: errors.array()
+            });
+        }
+
+        const {
+            conversationSegments,
+            title = null,
+            speakerPauseDuration = 0.5
+        } = req.body;
+
+        // Calculate total character count
+        const totalCharacterCount = conversationSegments.reduce((sum, segment) => sum + segment.text.length, 0);
+
+        // Validate total character limit
+        if (totalCharacterCount > 10000) {
+            return res.status(400).json({
+                success: false,
+                message: 'Total conversation length exceeds 10,000 characters'
+            });
+        }
+
+        // Get userId from authenticated user or use 'anonymous'
+        const userId = req.user ? req.user.id : 'anonymous';
+
+        // Generate conversation TTS audio
+        const result = await generateConversationTTS({
+            conversationSegments,
+            userId: userId,
+            speakerPauseDuration
+        });
+
+        // Save to conversation history if user is authenticated and it's not a cache hit
+        if (req.user && !result.cacheHit) {
+            try {
+                // Extract filename from audioUrl
+                const audioFilename = result.audioUrl.split('/').pop();
+                
+                await conversationHistoryModel.create({
+                    userId: req.user.id,
+                    title: title || `Conversation - ${new Date().toLocaleDateString()}`,
+                    conversationSegments: conversationSegments,
+                    totalCharacterCount: result.totalCharacterCount,
+                    estimatedCostUSD: result.estimatedCostUSD,
+                    totalDuration: result.duration,
+                    audioUrl: result.audioUrl,
+                    audioFilename: audioFilename
+                });
+            } catch (historyError) {
+                console.error('Failed to save conversation history:', historyError);
+                // Don't fail the request if history save fails
+            }
+        }
+
+        // Conversation generation completed successfully
+        res.json({
+            success: true,
+            audioUrl: result.audioUrl,
+            totalCharacterCount: result.totalCharacterCount,
+            estimatedCostUSD: result.estimatedCostUSD,
+            duration: result.duration,
+            conversationSegments: result.conversationSegments,
+            speakerCount: conversationSegments.length,
+            cacheHit: result.cacheHit || false
+        });
+
+    } catch (error) {
+        console.error('Conversation TTS generation error:', error.message);
+        
+        // Handle specific error types
+        if (error.message.includes('quota')) {
+            return res.status(429).json({
+                success: false,
+                message: 'TTS quota exceeded. Please try again later.',
+                error: 'QUOTA_EXCEEDED'
+            });
+        }
+        
+        if (error.message.includes('authentication')) {
+            return res.status(401).json({
+                success: false,
+                message: 'Authentication failed with Google Cloud TTS.',
+                error: 'AUTH_FAILED'
+            });
+        }
+
+        if (error.message.includes('billing')) {
+            return res.status(402).json({
+                success: false,
+                message: 'Billing account required for TTS service.',
+                error: 'BILLING_REQUIRED'
+            });
+        }
+
+        res.status(500).json({
+            success: false,
+            message: 'Failed to generate conversation TTS audio. Please try again.',
+            error: 'CONVERSATION_GENERATION_FAILED'
+        });
+    }
+});
+
+/**
  * @route GET /api/tts/usage
- * @desc Get TTS usage statistics (anonymous usage for standalone)
+ * @desc Get TTS usage statistics (supports both authenticated and anonymous users)
  * @access Public
  */
-router.get('/usage', async (req, res) => {
+router.get('/usage', optionalAuth, async (req, res) => {
     try {
         const { period = 'month' } = req.query; // month, week, day
         
-        const usage = await getTTSUsage('anonymous', period);
+        // For authenticated users, get usage from database (includes both standard and conversation)
+        if (req.user) {
+            const userId = req.user.id;
+            const now = new Date();
+            let startDate;
+            
+            switch (period) {
+                case 'day':
+                    startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+                    break;
+                case 'week':
+                    const dayOfWeek = now.getDay();
+                    startDate = new Date(now.getTime() - dayOfWeek * 24 * 60 * 60 * 1000);
+                    startDate.setHours(0, 0, 0, 0);
+                    break;
+                case 'month':
+                default:
+                    startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+                    break;
+            }
+            
+             // Get stats from both tables
+             const audioStats = await audioHistoryModel.getUserStatsForPeriod(userId, startDate.toISOString());
+             const conversationStats = await conversationHistoryModel.getUserStatsForPeriod(userId, startDate.toISOString());
+             
+             const totalCharacters = (audioStats?.total_characters || 0) + (conversationStats?.total_characters || 0);
+             const totalRequests = (audioStats?.total_generations || 0) + (conversationStats?.total_conversations || 0);
+             
+             // Calculate cost using predefined formula (Standard voice rate: $0.000004 per character)
+             const costPerCharacter = 0.000004; // $4 per 1M characters for standard voices
+             const totalCostUSD = totalCharacters * costPerCharacter;
+            
+            const TTS_CONFIG = {
+                freeQuotaPerMonth: 1000000 // 1M characters free per month
+            };
+            const remainingQuota = Math.max(0, TTS_CONFIG.freeQuotaPerMonth - totalCharacters);
+            
+            let endDate;
+            switch (period) {
+                case 'day':
+                    endDate = new Date(startDate.getTime() + 24 * 60 * 60 * 1000);
+                    break;
+                case 'week':
+                    endDate = new Date(startDate.getTime() + 7 * 24 * 60 * 60 * 1000);
+                    break;
+                case 'month':
+                default:
+                    endDate = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+                    break;
+            }
+            
+            return res.json({
+                success: true,
+                usage: {
+                    totalCharacters: totalCharacters || 0,
+                    totalRequests: totalRequests || 0,
+                    totalCostUSD: parseFloat((totalCostUSD || 0).toFixed(4)),
+                    period: period,
+                    startDate: startDate.toISOString(),
+                    endDate: endDate.toISOString(),
+                    remainingQuota: remainingQuota
+                }
+            });
+        }
+        
+        // For anonymous users, use cache-based approach
+        const userId = 'anonymous';
+        const usage = await getTTSUsage(userId, period);
         
         res.json({
             success: true,

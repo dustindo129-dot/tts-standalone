@@ -14,16 +14,30 @@ const usageCache = new Map();
 
 // Configuration
 const TTS_CONFIG = {
-    costPerCharacterUSD: 0.000004, // $4 per 1M characters
+    // Pricing per character (Google Cloud TTS pricing)
+    standardCostPerCharacterUSD: 0.000004, // $4 per 1M characters for Standard voices
+    neural2CostPerCharacterUSD: 0.000016, // $16 per 1M characters for Neural2 voices
     freeQuotaPerMonth: 1000000, // 1M characters free per month
     cacheDirectory: path.join(process.cwd(), 'public', 'tts-cache'),
     maxCacheSizeMB: 1000, // 1GB cache limit
     cacheExpiryHours: 168 // 7 days
 };
 
-// Calculate cost in USD
-const calculateCostUSD = (characterCount) => {
-    const costUSD = characterCount * TTS_CONFIG.costPerCharacterUSD;
+// Check if voice is Neural2
+const isNeural2Voice = (voiceName) => {
+    return voiceName.includes('Neural2') || 
+           voiceName === 'neural-female' || 
+           voiceName === 'neural-male';
+};
+
+// Calculate cost in USD based on voice type and character count
+const calculateCostUSD = (characterCount, voiceName) => {
+    const isNeural = isNeural2Voice(voiceName);
+    const costPerCharacter = isNeural 
+        ? TTS_CONFIG.neural2CostPerCharacterUSD 
+        : TTS_CONFIG.standardCostPerCharacterUSD;
+    
+    const costUSD = characterCount * costPerCharacter;
     return Math.round(costUSD * 100) / 100; // Round to 2 decimal places
 };
 
@@ -330,11 +344,11 @@ export const generateTTS = async (request) => {
         
         // Track usage (only if userId provided)
         if (userId && userId !== 'anonymous') {
-            trackTTSUsage(userId, characterCount);
+            trackTTSUsage(userId, characterCount, voiceName);
         }
         
-        // Calculate cost
-        const estimatedCostUSD = calculateCostUSD(characterCount);
+        // Calculate cost based on voice type
+        const estimatedCostUSD = calculateCostUSD(characterCount, voiceName);
         
         // Clean old cache files periodically
         if (Math.random() < 0.1) { // 10% chance
@@ -359,7 +373,7 @@ export const generateTTS = async (request) => {
 };
 
 // Track TTS usage for a user
-const trackTTSUsage = (userId, characterCount) => {
+const trackTTSUsage = (userId, characterCount, voiceName) => {
     const today = new Date().toISOString().split('T')[0];
     const userKey = `${userId}-${today}`;
     
@@ -376,7 +390,7 @@ const trackTTSUsage = (userId, characterCount) => {
     const usage = usageCache.get(userKey);
     usage.totalCharacters += characterCount;
     usage.totalRequests += 1;
-    usage.totalCostUSD += calculateCostUSD(characterCount);
+    usage.totalCostUSD += calculateCostUSD(characterCount, voiceName);
     
     usageCache.set(userKey, usage);
 };
@@ -440,16 +454,39 @@ export const getTTSUsage = async (userId = 'anonymous', period = 'month') => {
 // Get TTS pricing information
 export const getTTSPricing = async () => {
     return {
-        costPerCharacterUSD: TTS_CONFIG.costPerCharacterUSD,
-        costPer1000CharactersUSD: calculateCostUSD(1000),
+        standardCostPerCharacterUSD: TTS_CONFIG.standardCostPerCharacterUSD,
+        neural2CostPerCharacterUSD: TTS_CONFIG.neural2CostPerCharacterUSD,
+        standardCostPer1000CharactersUSD: calculateCostUSD(1000, 'female'),
+        neural2CostPer1000CharactersUSD: calculateCostUSD(1000, 'neural-female'),
         freeQuotaPerMonth: TTS_CONFIG.freeQuotaPerMonth,
         supportedVoices: [
-            { value: 'female', label: 'Female (Standard)', googleVoice: 'en-US-Standard-C' },
-            { value: 'male', label: 'Male (Standard)', googleVoice: 'en-US-Standard-B' },
-            { value: 'neural-female', label: 'Female (Neural2)', googleVoice: 'en-US-Neural2-F' },
-            { value: 'neural-male', label: 'Male (Neural2)', googleVoice: 'en-US-Neural2-D' }
+            { 
+                value: 'female', 
+                label: 'Female (Standard)', 
+                googleVoice: 'en-US-Standard-C',
+                costPer1000Chars: calculateCostUSD(1000, 'female')
+            },
+            { 
+                value: 'male', 
+                label: 'Male (Standard)', 
+                googleVoice: 'en-US-Standard-B',
+                costPer1000Chars: calculateCostUSD(1000, 'male')
+            },
+            { 
+                value: 'neural-female', 
+                label: 'Female (Neural2)', 
+                googleVoice: 'en-US-Neural2-F',
+                costPer1000Chars: calculateCostUSD(1000, 'neural-female')
+            },
+            { 
+                value: 'neural-male', 
+                label: 'Male (Neural2)', 
+                googleVoice: 'en-US-Neural2-D',
+                costPer1000Chars: calculateCostUSD(1000, 'neural-male')
+            }
         ],
         qualityLevel: 'Standard & Neural2 quality voices',
+        pricingNote: 'Standard voices: $4 per 1M characters. Neural2 voices: $16 per 1M characters.',
         lastUpdated: new Date().toISOString()
     };
 };
@@ -466,6 +503,177 @@ export const initializeTTSService = async () => {
     setInterval(cleanCache, 6 * 60 * 60 * 1000);
 };
 
+// Generate conversation TTS with proper speaker separation
+export const generateConversationTTS = async (request) => {
+    const {
+        conversationSegments, // Array of {text, voiceName}
+        userId = 'anonymous',
+        speakerPauseDuration = 0.5 // seconds of pause between speakers
+    } = request;
+
+    try {
+        ensureCacheDirectory();
+        
+        // Generate cache key for the entire conversation
+        const conversationString = JSON.stringify(conversationSegments);
+        const cacheKey = generateCacheKey(conversationString, 'conversation', {});
+        const hashPart = cacheKey.substring(0, 12);
+        const timestamp = Date.now();
+        
+        const filename = `conversation-${hashPart}-${timestamp}.wav`;
+        const cacheFilePath = path.join(TTS_CONFIG.cacheDirectory, filename);
+        
+        // Check if cached version exists
+        const existingFiles = fs.readdirSync(TTS_CONFIG.cacheDirectory);
+        const existingFile = existingFiles.find(file => 
+            file.includes(hashPart) && file.includes('conversation')
+        );
+        
+        if (existingFile) {
+            const totalCharacters = conversationSegments.reduce((sum, segment) => sum + segment.text.length, 0);
+            return {
+                audioUrl: `${process.env.BACKEND_URL || 'http://localhost:5000'}/tts-cache/${existingFile}`,
+                totalCharacterCount: totalCharacters,
+                estimatedCostUSD: 0, // No cost for cached content
+                cacheHit: true,
+                duration: Math.ceil(totalCharacters / 10),
+                conversationSegments
+            };
+        }
+
+        // Generate TTS for each segment
+        const audioBuffers = [];
+        let totalCharacters = 0;
+        let totalCost = 0;
+        let totalDuration = 0;
+
+        for (let i = 0; i < conversationSegments.length; i++) {
+            const segment = conversationSegments[i];
+            const voiceName = VOICE_MAP[segment.voiceName] || VOICE_MAP['female'];
+            
+            // Generate TTS for this segment
+            const segmentRequest = {
+                input: { text: segment.text },
+                voice: {
+                    languageCode: 'en-US',
+                    name: voiceName
+                },
+                audioConfig: {
+                    audioEncoding: 'MP3',
+                    speakingRate: 1.0,
+                    pitch: 0.0,
+                    volumeGainDb: 0.0,
+                    sampleRateHertz: 24000
+                }
+            };
+
+            let segmentResponse;
+            
+            if (ttsClient) {
+                try {
+                    const [response] = await ttsClient.synthesizeSpeech(segmentRequest);
+                    segmentResponse = response.audioContent;
+                } catch (googleError) {
+                    console.error('Google Cloud TTS API error for segment:', googleError.message);
+                    const mockResponse = await generateMockTTS({ 
+                        text: segment.text, 
+                        voiceName, 
+                        audioConfig: {} 
+                    });
+                    segmentResponse = mockResponse.audioContent;
+                }
+            } else {
+                const mockResponse = await generateMockTTS({ 
+                    text: segment.text, 
+                    voiceName, 
+                    audioConfig: {} 
+                });
+                segmentResponse = mockResponse.audioContent;
+            }
+
+            audioBuffers.push(segmentResponse);
+            
+            // Add pause between speakers (except after last segment)
+            if (i < conversationSegments.length - 1) {
+                const pauseBuffer = generateSilenceBuffer(speakerPauseDuration);
+                audioBuffers.push(pauseBuffer);
+            }
+
+            totalCharacters += segment.text.length;
+            totalCost += calculateCostUSD(segment.text.length, voiceName);
+            totalDuration += Math.ceil(segment.text.length / 10);
+        }
+
+        // Combine all audio buffers
+        const combinedAudio = Buffer.concat(audioBuffers);
+        
+        // Save combined audio to cache
+        fs.writeFileSync(cacheFilePath, combinedAudio);
+        
+        // Track usage
+        if (userId && userId !== 'anonymous') {
+            trackTTSUsage(userId, totalCharacters, 'conversation');
+        }
+        
+        // Clean old cache files periodically
+        if (Math.random() < 0.1) {
+            cleanCache();
+        }
+
+        return {
+            audioUrl: `${process.env.BACKEND_URL || 'http://localhost:5000'}/tts-cache/${filename}`,
+            totalCharacterCount: totalCharacters,
+            estimatedCostUSD: totalCost,
+            duration: totalDuration + (conversationSegments.length - 1) * speakerPauseDuration,
+            cacheHit: false,
+            conversationSegments
+        };
+
+    } catch (error) {
+        console.error('Conversation TTS service error:', error.message);
+        throw new Error(`Conversation TTS generation failed: ${error.message}`);
+    }
+};
+
+// Generate a silence buffer for pause between speakers
+const generateSilenceBuffer = (durationSeconds) => {
+    // Generate silence for MP3 - just return a small MP3 silence buffer
+    // For simplicity, we'll create a minimal MP3 header with silence
+    const silenceDuration = Math.max(0.1, durationSeconds); // Minimum 0.1 seconds
+    const sampleRate = 24000;
+    const numSamples = Math.floor(sampleRate * silenceDuration);
+    
+    // Create silent samples (zeros)
+    const silentSamples = Buffer.alloc(numSamples * 2); // 16-bit samples
+    
+    // Create simple WAV header for silence
+    const dataSize = silentSamples.length;
+    const fileSize = 36 + dataSize;
+    
+    const wavHeader = Buffer.from([
+        // RIFF chunk
+        0x52, 0x49, 0x46, 0x46, // "RIFF"
+        fileSize & 0xFF, (fileSize >> 8) & 0xFF, (fileSize >> 16) & 0xFF, (fileSize >> 24) & 0xFF,
+        0x57, 0x41, 0x56, 0x45, // "WAVE"
+        
+        // fmt chunk
+        0x66, 0x6D, 0x74, 0x20, // "fmt "
+        0x10, 0x00, 0x00, 0x00, // Chunk size (16)
+        0x01, 0x00, // Audio format (1 = PCM)
+        0x01, 0x00, // Number of channels (1 = mono)
+        sampleRate & 0xFF, (sampleRate >> 8) & 0xFF, (sampleRate >> 16) & 0xFF, (sampleRate >> 24) & 0xFF,
+        (sampleRate * 2) & 0xFF, ((sampleRate * 2) >> 8) & 0xFF, ((sampleRate * 2) >> 16) & 0xFF, ((sampleRate * 2) >> 24) & 0xFF,
+        0x02, 0x00, // Block align
+        0x10, 0x00, // Bits per sample (16)
+        
+        // data chunk
+        0x64, 0x61, 0x74, 0x61, // "data"
+        dataSize & 0xFF, (dataSize >> 8) & 0xFF, (dataSize >> 16) & 0xFF, (dataSize >> 24) & 0xFF
+    ]);
+    
+    return Buffer.concat([wavHeader, silentSamples]);
+};
+
 // Don't auto-initialize on import - server will call initializeTTSService() after env vars are loaded
 // (async () => {
 //     await initializeTTSService();
@@ -473,6 +681,7 @@ export const initializeTTSService = async () => {
 
 export default {
     generateTTS,
+    generateConversationTTS,
     getTTSUsage,
     getTTSPricing
 };

@@ -4,7 +4,10 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import ttsRoutes from './routes/tts.js';
+import authRoutes from './routes/auth.js';
+import historyRoutes from './routes/history.js';
 import { initializeTTSService } from './services/ttsService.js';
+import { initializeDatabase } from './db/database.js';
 
 // Load environment variables
 dotenv.config();
@@ -39,6 +42,8 @@ app.use('/tts-cache', (req, res, next) => {
 
 // API routes
 app.use('/api/tts', ttsRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/history', historyRoutes);
 
 
 // 404 handler
@@ -63,6 +68,14 @@ const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, async () => {
     console.log(`TTS Server running on port ${PORT}`);
+    
+    // Initialize database
+    try {
+        await initializeDatabase();
+        console.log('Database initialized');
+    } catch (error) {
+        console.error('Database initialization failed:', error.message);
+    }
     
     // Initialize TTS service
     if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {

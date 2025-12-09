@@ -1,9 +1,21 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import './App.css';
+import { useAuth } from './contexts/AuthContext';
+import Auth from './components/Auth';
+import Profile from './components/Profile';
+import ApiDocs from './components/ApiDocs';
 
 function App() {
+  // Auth state
+  const { user, isAuthenticated, token } = useAuth();
+  const [showAuth, setShowAuth] = useState(false);
+  const [authMode, setAuthMode] = useState('login'); // 'login' or 'signup'
+  const [currentPage, setCurrentPage] = useState('tts'); // 'tts', 'profile', or 'api-docs'
+
   // State management
+  const [inputMode, setInputMode] = useState('standard'); // 'standard' or 'conversation'
   const [text, setText] = useState('');
+  const [audioTitle, setAudioTitle] = useState(''); // Optional title for standard mode
   const [voice, setVoice] = useState('female'); // female, male, neural-female, neural-male
   const [speakingRate, setSpeakingRate] = useState(1.0);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -15,9 +27,15 @@ function App() {
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [volume, setVolume] = useState(1.0);
+  const [isLooping, setIsLooping] = useState(false);
   const [voices, setVoices] = useState([]);
-  const [pricing, setPricing] = useState(null);
-  const [usage, setUsage] = useState(null);
+  
+  // Conversation mode state
+  const [conversationSegments, setConversationSegments] = useState([
+    { id: 1, text: '', voiceName: 'female' },
+    { id: 2, text: '', voiceName: 'male' }
+  ]);
+  const [conversationTitle, setConversationTitle] = useState('');
 
   // Refs
   const audioRef = useRef(null);
@@ -25,8 +43,6 @@ function App() {
   // Fetch available voices on component mount
   useEffect(() => {
     fetchVoices();
-    fetchPricing();
-    fetchUsage();
   }, []);
 
   // Update audio element properties when volume changes
@@ -35,6 +51,13 @@ function App() {
       audioRef.current.volume = volume;
     }
   }, [volume]);
+
+  // Update loop when state changes
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.loop = isLooping;
+    }
+  }, [isLooping]);
 
   // Track audio progress
   useEffect(() => {
@@ -53,10 +76,12 @@ function App() {
     audio.addEventListener('timeupdate', updateTime);
     audio.addEventListener('loadedmetadata', updateDuration);
     audio.addEventListener('ended', () => {
-      setIsPlaying(false);
-      setIsPaused(false);
-      setCurrentTime(0);
-      setProgress(0);
+      if (!isLooping) {
+        setIsPlaying(false);
+        setIsPaused(false);
+        setCurrentTime(0);
+        setProgress(0);
+      }
     });
 
     return () => {
@@ -80,43 +105,24 @@ function App() {
     }
   };
 
-  // Fetch pricing information
-  const fetchPricing = async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/tts/pricing`);
-      const data = await response.json();
-      if (data.success) {
-        setPricing(data.pricing);
-      }
-    } catch (err) {
-      console.error('Failed to fetch pricing:', err);
-    }
-  };
-
-  // Fetch usage statistics
-  const fetchUsage = async () => {
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/tts/usage`);
-      const data = await response.json();
-      if (data.success) {
-        setUsage(data.usage);
-      }
-    } catch (err) {
-      console.error('Failed to fetch usage:', err);
-    }
-  };
-
   // Generate TTS audio
   const generateTTS = async (text) => {
     try {
       setLoading(true);
       setError('');
       
+      const headers = {
+        'Content-Type': 'application/json',
+      };
+      
+      // Add authorization header if user is logged in
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
       const response = await fetch(`${API_BASE_URL}/api/tts/generate`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: headers,
         body: JSON.stringify({
           text: text,
           languageCode: 'en-US',
@@ -138,8 +144,59 @@ function App() {
       const data = await response.json();
       setAudioUrl(data.audioUrl);
       
-      // Update usage statistics
-      fetchUsage();
+      return data.audioUrl;
+    } catch (err) {
+      setError(err.message);
+      throw err;
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Generate conversation TTS audio
+  const generateConversationTTS = async () => {
+    try {
+      setLoading(true);
+      setError('');
+      
+      // Filter out empty segments
+      const validSegments = conversationSegments.filter(seg => seg.text.trim());
+      
+      if (validSegments.length === 0) {
+        setError('Please enter text for at least one conversation segment');
+        setLoading(false);
+        return;
+      }
+      
+      const headers = {
+        'Content-Type': 'application/json',
+      };
+      
+      // Add authorization header if user is logged in
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
+      const response = await fetch(`${API_BASE_URL}/api/tts/generate-conversation`, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify({
+          conversationSegments: validSegments.map(seg => ({
+            text: seg.text,
+            voiceName: seg.voiceName
+          })),
+          title: conversationTitle || null,
+          speakerPauseDuration: 0.5
+        })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.message || 'Conversation TTS generation failed');
+      }
+      
+      const data = await response.json();
+      setAudioUrl(data.audioUrl);
       
       return data.audioUrl;
     } catch (err) {
@@ -148,6 +205,27 @@ function App() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // Conversation segment handlers
+  const addConversationSegment = () => {
+    const newId = Math.max(...conversationSegments.map(s => s.id)) + 1;
+    setConversationSegments([
+      ...conversationSegments,
+      { id: newId, text: '', voiceName: 'female' }
+    ]);
+  };
+
+  const removeConversationSegment = (id) => {
+    if (conversationSegments.length > 1) {
+      setConversationSegments(conversationSegments.filter(seg => seg.id !== id));
+    }
+  };
+
+  const updateConversationSegment = (id, field, value) => {
+    setConversationSegments(conversationSegments.map(seg => 
+      seg.id === id ? { ...seg, [field]: value } : seg
+    ));
   };
 
   // Play audio
@@ -166,21 +244,41 @@ function App() {
       return;
     }
 
-    if (!text.trim()) {
-      setError('Please enter text to synthesize');
-      return;
-    }
-
-    try {
-      const url = await generateTTS(text);
-      if (url && audioRef.current) {
-        audioRef.current.src = url;
-        audioRef.current.playbackRate = speakingRate;
-        audioRef.current.play();
-        setIsPlaying(true);
+    // Handle different input modes
+    if (inputMode === 'standard') {
+      if (!text.trim()) {
+        setError('Please enter text to synthesize');
+        return;
       }
-    } catch (err) {
-      // Error already handled in generateTTS
+
+      try {
+        const url = await generateTTS(text);
+        if (url && audioRef.current) {
+          audioRef.current.src = url;
+          audioRef.current.playbackRate = speakingRate;
+          audioRef.current.play();
+          setIsPlaying(true);
+        }
+      } catch (err) {
+        // Error already handled in generateTTS
+      }
+    } else if (inputMode === 'conversation') {
+      const validSegments = conversationSegments.filter(seg => seg.text.trim());
+      if (validSegments.length === 0) {
+        setError('Please enter text for at least one conversation segment');
+        return;
+      }
+
+      try {
+        const url = await generateConversationTTS();
+        if (url && audioRef.current) {
+          audioRef.current.src = url;
+          audioRef.current.play();
+          setIsPlaying(true);
+        }
+      } catch (err) {
+        // Error already handled in generateConversationTTS
+      }
     }
   };
 
@@ -193,16 +291,20 @@ function App() {
     }
   };
 
-  // Stop audio
-  const handleStop = () => {
+  // Clear audio
+  const handleClear = () => {
     if (audioRef.current) {
       audioRef.current.pause();
+      audioRef.current.src = '';
       audioRef.current.currentTime = 0;
-      setIsPlaying(false);
-      setIsPaused(false);
-      setCurrentTime(0);
-      setProgress(0);
     }
+    setIsPlaying(false);
+    setIsPaused(false);
+    setAudioUrl(null);
+    setCurrentTime(0);
+    setProgress(0);
+    setDuration(0);
+    setIsLooping(false);
   };
 
   // Seek in audio
@@ -249,70 +351,174 @@ function App() {
     <div className="tts-app">
       <header className="header">
         <div className="container">
-          <h1>🎤 Cloud Text-to-Speech Service</h1>
-          <p>Convert English text to natural-sounding audio powered by Google Cloud TTS (Project by Dustin Do)</p>
+          <div className="header-content">
+            <div className="header-text">
+              <h1>🎤 Cloud Text-to-Speech Service</h1>
+              <p>Convert English text to natural-sounding audio powered by Google Cloud TTS (Project by Dustin Do)</p>
+            </div>
+            <div className="header-actions">
+              {isAuthenticated ? (
+                <button onClick={() => setCurrentPage('profile')} className="user-btn">
+                  👤 {user?.username}
+                </button>
+              ) : (
+                <>
+                  <button onClick={() => { setAuthMode('login'); setShowAuth(true); }} className="login-btn">
+                    🔐 Login
+                  </button>
+                  <button onClick={() => { setAuthMode('signup'); setShowAuth(true); }} className="signup-btn">
+                    📝 Sign Up
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
         </div>
       </header>
 
-      <main className="main">
-        <div className="container">
-          <div className="tts-interface">
+      {currentPage === 'tts' ? (
+        <main className="main">
+          <div className="container">
+            <div className="tts-interface">
             
-            {/* Text Input Section */}
+            {/* Text Input Section with Tabs */}
             <section className="input-section">
               <div className="section-header">
                 <h2>📝 Text Input</h2>
-                <span className="char-count">{text.length} / 100,000 characters</span>
+                <div className="input-mode-tabs">
+                  <button 
+                    className={`tab-btn ${inputMode === 'standard' ? 'active' : ''}`}
+                    onClick={() => setInputMode('standard')}
+                  >
+                    Standard
+                  </button>
+                  <button 
+                    className={`tab-btn ${inputMode === 'conversation' ? 'active' : ''}`}
+                    onClick={() => setInputMode('conversation')}
+                  >
+                    Conversation
+                  </button>
+                </div>
               </div>
-              
-              <textarea
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                placeholder="Enter your English text here to convert to speech..."
-                rows={8}
-                maxLength={100000}
-                className="text-input"
-              />
 
-              {/* Voice and Settings */}
-              <div className="settings-grid">
-                <div className="setting-group">
-                  <label>🎭 Voice:</label>
-                  <select value={voice} onChange={(e) => setVoice(e.target.value)} className="select-input">
-                    {voices.map(v => (
-                      <option key={v.value} value={v.value}>
-                        {v.label} - {v.description}
-                      </option>
+              {/* Standard Mode */}
+              {inputMode === 'standard' && (
+                <>
+                  <div className="standard-header">
+                    <input
+                      type="text"
+                      value={audioTitle}
+                      onChange={(e) => setAudioTitle(e.target.value)}
+                      placeholder="Audio title (optional)"
+                      className="audio-title-input"
+                    />
+                  </div>
+                  
+                  <div className="text-input-wrapper">
+                    <textarea
+                      value={text}
+                      onChange={(e) => setText(e.target.value)}
+                      placeholder="Enter your English text here to convert to speech..."
+                      rows={8}
+                      maxLength={100000}
+                      className="text-input"
+                    />
+                    <div className="char-count-bottom">
+                      <span className="char-count">{text.length} / 100,000 characters</span>
+                    </div>
+                  </div>
+
+                  {/* Voice Settings */}
+                  <div className="settings-grid">
+                    <div className="setting-group">
+                      <label>🎭 Voice:</label>
+                      <select value={voice} onChange={(e) => setVoice(e.target.value)} className="select-input">
+                        {voices.map(v => (
+                          <option key={v.value} value={v.value}>
+                            {v.label} - {v.description}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* Conversation Mode */}
+              {inputMode === 'conversation' && (
+                <div className="conversation-mode">
+                  <div className="conversation-header">
+                    <input
+                      type="text"
+                      value={conversationTitle}
+                      onChange={(e) => setConversationTitle(e.target.value)}
+                      placeholder="Conversation title (optional)"
+                      className="conversation-title-input"
+                    />
+                  </div>
+
+                  <div className="conversation-table">
+                    <div className="conversation-table-header">
+                      <div className="col-text">Text</div>
+                      <div className="col-voice">Voice / Model</div>
+                      <div className="col-actions">Actions</div>
+                    </div>
+
+                    {conversationSegments.map((segment, index) => (
+                      <div key={segment.id} className="conversation-row">
+                        <div className="col-text">
+                          <textarea
+                            value={segment.text}
+                            onChange={(e) => updateConversationSegment(segment.id, 'text', e.target.value)}
+                            placeholder={`Speaker ${index + 1} text...`}
+                            rows={3}
+                            maxLength={1000}
+                            className="conversation-text-input"
+                          />
+                          <span className="segment-char-count">{segment.text.length} / 1,000</span>
+                        </div>
+                        
+                        <div className="col-voice">
+                          <select 
+                            value={segment.voiceName} 
+                            onChange={(e) => updateConversationSegment(segment.id, 'voiceName', e.target.value)}
+                            className="conversation-voice-select"
+                          >
+                            {voices.map(v => (
+                              <option key={v.value} value={v.value}>
+                                {v.label}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div className="col-actions">
+                          <button
+                            onClick={() => removeConversationSegment(segment.id)}
+                            className="btn-remove-segment"
+                            disabled={conversationSegments.length === 1}
+                            title="Remove segment"
+                          >
+                            🗑️
+                          </button>
+                        </div>
+                      </div>
                     ))}
-                  </select>
-                </div>
+                  </div>
 
-                <div className="setting-group">
-                  <label>⚡ Speed: {speakingRate}x</label>
-                  <input
-                    type="range"
-                    min="0.25"
-                    max="2.0"
-                    step="0.25"
-                    value={speakingRate}
-                    onChange={(e) => handleSpeedChange(parseFloat(e.target.value))}
-                    className="range-input"
-                  />
-                </div>
+                  <button
+                    onClick={addConversationSegment}
+                    className="btn-add-segment"
+                    disabled={conversationSegments.length >= 20}
+                  >
+                    ➕ Add Segment
+                  </button>
 
-                <div className="setting-group">
-                  <label>🔊 Volume: {Math.round(volume * 100)}%</label>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.1"
-                    value={volume}
-                    onChange={(e) => setVolume(parseFloat(e.target.value))}
-                    className="range-input"
-                  />
+                  {conversationSegments.length >= 20 && (
+                    <p className="warning-text">Maximum 20 segments reached</p>
+                  )}
                 </div>
-              </div>
+              )}
             </section>
 
             {/* Error Display */}
@@ -331,35 +537,91 @@ function App() {
               <div className="primary-controls">
                 <button 
                   onClick={handlePlay} 
-                  disabled={loading || !text.trim()}
+                  disabled={loading || audioUrl || (inputMode === 'standard' && !text.trim()) || (inputMode === 'conversation' && conversationSegments.filter(s => s.text.trim()).length === 0)}
                   className={`btn btn-primary ${loading ? 'loading' : ''}`}
                 >
                   {loading ? (
-                    <>🔄 Generating...</>
-                  ) : isPlaying ? (
-                    <>▶️ Playing...</>
+                    <>Generating...</>
+                  ) : inputMode === 'conversation' ? (
+                    <>🎵 Generate Conversation</>
                   ) : (
                     <>🎵 Generate & Play</>
                   )}
                 </button>
 
-                {(isPlaying || isPaused) && (
+                {audioUrl && (
                   <>
-                    <button onClick={handlePause} className="btn btn-secondary">
-                      ⏸️ Pause
+                    {isPlaying ? (
+                      <button onClick={handlePause} className="btn btn-secondary">
+                        ⏸️ Pause
+                      </button>
+                    ) : isPaused ? (
+                      <button onClick={handlePlay} className="btn btn-secondary">
+                        ▶️ Resume
+                      </button>
+                    ) : (
+                      <button onClick={handlePlay} className="btn btn-secondary">
+                        ▶️ Play
+                      </button>
+                    )}
+                    <button onClick={handleClear} className="btn btn-secondary">
+                      🗑️ Clear
                     </button>
-                    <button onClick={handleStop} className="btn btn-secondary">
-                      ⏹️ Stop
+                    <button onClick={handleDownload} className="btn btn-success">
+                      💾 Download MP3
                     </button>
                   </>
                 )}
-
-                {audioUrl && (
-                  <button onClick={handleDownload} className="btn btn-success">
-                    💾 Download MP3
-                  </button>
-                )}
               </div>
+
+              {/* Speed and Volume Controls - Only show when audio exists */}
+              {audioUrl && (
+                <div className="audio-controls">
+                  <div className="audio-controls-grid">
+                    <div className="control-group">
+                      <label>⚡ Speed: {speakingRate}x</label>
+                      <input
+                        type="range"
+                        min="0.25"
+                        max="2.0"
+                        step="0.25"
+                        value={speakingRate}
+                        onChange={(e) => handleSpeedChange(parseFloat(e.target.value))}
+                        className="range-input"
+                      />
+                    </div>
+
+                    <div className="control-group">
+                      <label>🔊 Volume: {Math.round(volume * 100)}%</label>
+                      <input
+                        type="range"
+                        min="0"
+                        max="1"
+                        step="0.1"
+                        value={volume}
+                        onChange={(e) => setVolume(parseFloat(e.target.value))}
+                        className="range-input"
+                      />
+                    </div>
+
+                    <div className="control-group control-group-horizontal">
+                      <label>Loop</label>
+                      <div className="toggle-container">
+                        <input
+                          type="checkbox"
+                          id="loop-toggle"
+                          checked={isLooping}
+                          onChange={(e) => setIsLooping(e.target.checked)}
+                          className="toggle-input"
+                        />
+                        <label htmlFor="loop-toggle" className="toggle-label">
+                          <span className="toggle-slider"></span>
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Audio Progress Bar */}
               {audioUrl && (
@@ -378,54 +640,14 @@ function App() {
               )}
             </section>
 
-            {/* Statistics Section */}
-            <section className="stats-section">
-              <div className="section-header">
-                <h2>📊 Usage & Pricing</h2>
-              </div>
-              
-              <div className="stats-grid">
-                {usage && (
-                  <div className="stat-card">
-                    <h3>📈 Usage Statistics</h3>
-                    <div className="stat-item">
-                      <span>Characters processed:</span>
-                      <strong>{usage.totalCharacters.toLocaleString()}</strong>
-                    </div>
-                    <div className="stat-item">
-                      <span>Total requests:</span>
-                      <strong>{usage.totalRequests}</strong>
-                    </div>
-                    <div className="stat-item">
-                      <span>Estimated cost:</span>
-                      <strong>${usage.totalCostUSD.toFixed(4)} USD</strong>
-                    </div>
-                  </div>
-                )}
-
-                {pricing && (
-                  <div className="stat-card">
-                    <h3>💰 Pricing Information</h3>
-                    <div className="stat-item">
-                      <span>Cost per 1000 chars:</span>
-                      <strong>${pricing.costPer1000CharactersUSD.toFixed(4)} USD</strong>
-                    </div>
-                    <div className="stat-item">
-                      <span>Free quota per month:</span>
-                      <strong>{pricing.freeQuotaPerMonth.toLocaleString()} chars</strong>
-                    </div>
-                    <div className="stat-item">
-                      <span>Quality:</span>
-                      <strong>{pricing.qualityLevel}</strong>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </section>
-
+            </div>
           </div>
-        </div>
-      </main>
+        </main>
+      ) : currentPage === 'profile' ? (
+        <Profile onBack={() => setCurrentPage('tts')} />
+      ) : (
+        <ApiDocs onBack={() => setCurrentPage('tts')} />
+      )}
 
       <footer className="footer">
         <div className="container">
@@ -435,8 +657,9 @@ function App() {
             🇺🇸 English Language Support
           </p>
           <p>
-            <a href="/api" target="_blank" rel="noopener noreferrer">API Documentation</a> | 
-            <a href="/health" target="_blank" rel="noopener noreferrer">Health Check</a>
+            <button onClick={() => setCurrentPage('api-docs')} className="footer-link">
+              API Documentation
+            </button>
           </p>
         </div>
       </footer>
@@ -450,6 +673,9 @@ function App() {
         }}
         style={{ display: 'none' }}
       />
+
+      {/* Auth Modal */}
+      {showAuth && <Auth onClose={() => setShowAuth(false)} initialMode={authMode} />}
     </div>
   );
 }
